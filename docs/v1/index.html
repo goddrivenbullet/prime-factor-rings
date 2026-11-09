@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#05080f">
+<title>Prime Factor Rings</title>
+<!-- prime-factor-rings-v1 -->
+<style>
+html,body{margin:0;width:100%;height:100%;height:100dvh;background:#05080f;overflow:hidden;position:fixed;inset:0;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+canvas{display:block;width:100%;height:100%;touch-action:none;overscroll-behavior:none;outline:none}
+#ui{position:fixed;left:0;right:0;bottom:max(14px,env(safe-area-inset-bottom));display:flex;flex-wrap:wrap;gap:8px;justify-content:center;z-index:2;pointer-events:none}
+#ui button{pointer-events:auto;background:rgba(255,255,255,.14);color:#eee;border:1px solid rgba(255,255,255,.28);border-radius:22px;padding:10px 16px;font:17px/1 -apple-system,system-ui,sans-serif;min-width:48px;min-height:48px;-webkit-appearance:none;appearance:none}
+#ui button:active{background:rgba(255,255,255,.28)}
+#ui button.on{background:rgba(120,200,255,.35);border-color:rgba(160,220,255,.5)}
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+<div id="ui">
+<button type="button" id="zm" aria-label="zoom out">−</button>
+<button type="button" id="zp" aria-label="zoom in">+</button>
+<button type="button" id="pp" aria-label="pause">❚❚</button>
+<button type="button" id="sp" aria-label="speed">1×</button>
+<button type="button" id="rv" aria-label="reset view">⟲</button>
+<button type="button" id="rs" aria-label="camera spin">✦</button>
+</div>
+<script>
+(function(){
+'use strict';
+const MARKER='prime-factor-rings-v1';
+const STORE_KEY='pfr_v1_state';
+const cv=document.getElementById('c'),ctx=cv.getContext('2d',{alpha:false});
+
+/* ---- Miller–Rabin (assert survivors) ---- */
+function modPow(b,e,m){let r=1n;b%=m;while(e>0n){if(e&1n)r=(r*b)%m;b=(b*b)%m;e>>=1n}return r}
+const MR_WIT=[2n,3n,5n,7n,11n,13n,17n,19n,23n,29n,31n,37n,41n];
+function isP(n){
+  if(typeof n!=='bigint')n=BigInt(n);
+  if(n<2n)return false; if(n%2n===0n)return n===2n;
+  if(n%3n===0n)return n===3n; if(n%5n===0n)return n===5n;
+  let d=n-1n,s=0n; while((d&1n)===0n){d>>=1n;s++}
+  for(const a of MR_WIT){
+    if(a>=n)continue;
+    let x=modPow(a,d,n);
+    if(x===1n||x===n-1n)continue;
+    let ok=false;
+    for(let r=1n;r<s;r++){x=(x*x)%n;if(x===n-1n){ok=true;break}}
+    if(!ok)return false;
+  }
+  return true;
+}
+
+/* Small primes for trial SPF */
+const SMALLP=[];
+(function(){
+  const N=4000,sieve=new Uint8Array(N); sieve[0]=sieve[1]=1;
+  for(let i=2;i*i<N;i++) if(!sieve[i]) for(let j=i*i;j<N;j+=i) sieve[j]=1;
+  for(let i=2;i<N;i++) if(!sieve[i]) SMALLP.push(i);
+})();
+function spf(n){
+  if(n<2)return n;
+  for(let i=0;i<SMALLP.length;i++){
+    const p=SMALLP[i];
+    if(p*p>n)break;
+    if(n%p===0)return p;
+  }
+  // fallback trial
+  let d=SMALLP[SMALLP.length-1]|1; if(d%2===0)d++;
+  for(;d*d<=n;d+=2) if(n%d===0)return d;
+  return n; // prime
+}
+
+/* ---- Poles (same as v5) ---- */
+const POLES=[{T:0,D:0}];
+for(let D=0;D<360;D++) for(let T=1;T<=180;T++) POLES.push({T,D});
+const N_POLES=POLES.length, PER=360;
+const DEG_MS=70, MAX_KEEP=500;
+const UZ_MIN=.3,UZ_MAX=8;
+const SIEVE_MS_SLOW=2500, SIEVE_MS_FAST=180;
+const MAX_LINES_FRAME=220;
+
+function poleAxis(T,D){
+  const Td=T*Math.PI/180, Dd=D*Math.PI/180;
+  const sT=Math.sin(Td), cT=Math.cos(Td);
+  return [sT*Math.cos(Dd), cT, -sT*Math.sin(Dd)];
+}
+function poleE(T,D){
+  const Dd=D*Math.PI/180;
+  return [Math.sin(Dd), 0, Math.cos(Dd)];
+}
+function pointOnRing(T,D,Adeg,th){
+  const a=poleAxis(T,D), e=poleE(T,D);
+  const cth=Math.cos(th), sth=Math.sin(th);
+  let vx=cth*a[0]+sth*e[0], vy=cth*a[1]+sth*e[1], vz=cth*a[2]+sth*e[2];
+  if(!Adeg) return [vx,vy,vz];
+  const A=Adeg*Math.PI/180, c=Math.cos(A), s=Math.sin(A);
+  const kx=a[0],ky=a[1],kz=a[2];
+  const cx=ky*vz-kz*vy, cy=kz*vx-kx*vz, cz=kx*vy-ky*vx;
+  const kd=kx*vx+ky*vy+kz*vz;
+  return [vx*c+cx*s+kx*kd*(1-c), vy*c+cy*s+ky*kd*(1-c), vz*c+cz*s+kz*kd*(1-c)];
+}
+function poleOfG(g){
+  const pi=((Math.floor(g/PER)%N_POLES)+N_POLES)%N_POLES;
+  return {pi, A:((g%PER)+PER)%PER, T:POLES[pi].T, D:POLES[pi].D};
+}
+
+/* ---- Overlap map (~1° equal-area) ---- */
+const NLAT=180;
+const cellOff=new Int32Array(NLAT+1);
+for(let i=0;i<NLAT;i++){
+  const lat=(-90+(i+0.5))*Math.PI/180;
+  const nlon=Math.max(1, Math.round(360*Math.max(0.02, Math.cos(lat))));
+  cellOff[i+1]=cellOff[i]+nlon;
+}
+const NCELL=cellOff[NLAT];
+const cellXYZ=new Float32Array(NCELL*3);
+const cellCounts=new Uint32Array(NCELL);
+let nonzero=[]; const nonzeroSet=new Set();
+(function(){
+  for(let i=0;i<NLAT;i++){
+    const lat=(-90+(i+0.5))*Math.PI/180, cl=Math.cos(lat), sl=Math.sin(lat);
+    const nlon=cellOff[i+1]-cellOff[i];
+    for(let j=0;j<nlon;j++){
+      const lon=-Math.PI+(j+0.5)/nlon*2*Math.PI;
+      const id=cellOff[i]+j;
+      cellXYZ[id*3]=Math.sin(lon)*cl; cellXYZ[id*3+1]=sl; cellXYZ[id*3+2]=Math.cos(lon)*cl;
+    }
+  }
+})();
+function cellIndex(x,y,z){
+  const lat=Math.asin(Math.max(-1,Math.min(1,y)));
+  const lon=Math.atan2(x,z);
+  let i=Math.floor(lat*180/Math.PI+90); if(i<0)i=0; if(i>=NLAT)i=NLAT-1;
+  const nlon=cellOff[i+1]-cellOff[i];
+  let t=(lon+Math.PI)/(2*Math.PI); if(t>=1)t-=1; if(t<0)t+=1;
+  let j=Math.floor(t*nlon); if(j>=nlon)j=nlon-1; if(j<0)j=0;
+  return cellOff[i]+j;
+}
+function bumpCell(idx){
+  if(cellCounts[idx]===0){nonzero.push(idx); nonzeroSet.add(idx)}
+  cellCounts[idx]++;
+}
+
+/* ---- Factor color ---- */
+function factorHue(a){
+  if(a===2)return 0;      // red
+  if(a===3)return 30;     // orange
+  if(a===5)return 55;     // yellow
+  if(a===7)return 180;    // cyan
+  if(a<=13)return 210;
+  return 280;             // violet
+}
+
+/* Build sieve plan for band g: waves of strikes by increasing a */
+function buildSieve(g){
+  const lo=360*g, hi=lo+360;
+  const alive=new Uint8Array(360); // 1=still lit
+  for(let i=0;i<360;i++) alive[i]=1;
+  // Collect composites and their factorizations (prefer SPF + a few more)
+  const byA=new Map(); // a -> [{slot, aSlot, n}]
+  const survivors=[]; // θ radians for primes (+1 on g=0), skipping 2,3,5
+  const mrCheck=[];
+  for(let n=lo;n<hi;n++){
+    const slot=n%360;
+    if(n<=1){
+      if(n===1 && g===0){ /* keep 1 at θ=1° */ survivors.push(1*Math.PI/180); }
+      else if(n===0||n===1){ /* knock 0 always; 1 only kept on g0 */ if(!(n===1&&g===0)) {/* will fade as non-prime */} }
+      continue;
+    }
+    if(n===2||n===3||n===5){
+      // skip as before for survivors feeding overlap; still show during sieve then remove
+      // Spec: survivors skip 2,3,5 — so they get struck visually? Treat as "not kept"
+      // Show them initially then fade without factor lines (or SPF strike)
+      const p=spf(n);
+      if(!byA.has(p)) byA.set(p,[]);
+      byA.get(p).push({slot, aSlot:p%360, n, spf:true});
+      continue;
+    }
+    const p=spf(n);
+    if(p===n){
+      // prime
+      survivors.push(slot*Math.PI/180);
+      mrCheck.push(n);
+      continue;
+    }
+    // composite: always SPF strike; optionally a few more factors if small band
+    if(!byA.has(p)) byA.set(p,[]);
+    byA.get(p).push({slot, aSlot:p%360, n, spf:true});
+    // Extra factor lines for early rings (visual richness), capped
+    if(g<40){
+      const lim=Math.floor(Math.sqrt(n));
+      let shown=0;
+      for(let a=p+1;a<=lim && shown<3;a++){
+        if(n%a===0){
+          const b=n/a; if(a>b)continue;
+          if(!byA.has(a)) byA.set(a,[]);
+          byA.get(a).push({slot, aSlot:a%360, n, spf:false});
+          shown++;
+        }
+      }
+    }
+  }
+  // For n=0,1 on ring 0: keep 1; knock out 0
+  if(g===0){
+    // slot 0 is n=0 — composite-ish; knock with a=2 style
+    if(!byA.has(2)) byA.set(2,[]);
+    byA.get(2).push({slot:0, aSlot:2, n:0, spf:true});
+  } else {
+    // knock 0 and 1 in band (360g, 360g+1) if present as slots
+    // slot for 360g is 0; for 360g+1 is 1 — not primes
+    if(!byA.has(2)) byA.set(2,[]);
+    byA.get(2).push({slot:0, aSlot:2, n:lo, spf:true});
+    if(!byA.has(3)) byA.set(3,[]);
+    byA.get(3).push({slot:1, aSlot:3, n:lo+1, spf:true});
+  }
+
+  const waves=[...byA.keys()].sort((a,b)=>a-b);
+  const plan=[]; // flattened strikes in wave order
+  for(const a of waves){
+    const hits=byA.get(a);
+    // Cap per wave for large g
+    const cap=g<20?hits.length:Math.min(hits.length, 80);
+    for(let i=0;i<cap;i++) plan.push({a, ...hits[i]});
+    // Always ensure every composite got at least SPF — already in plan via spf:true entries
+  }
+  return {alive, survivors, plan, waves, mrCheck};
+}
+
+/* ---- State ---- */
+const rings=[]; // trail after sieve
+const polesVisited=[]; const poleSeen=new Set();
+let gNext=0, poleIdx=0, Afloat=0, lastDropped=-1;
+let last=0, play=true, speed=1, camSpin=false, maxCount=1, lastSave=0;
+
+// Sieve state for the ring about to be committed
+let sieve=null; // {g,T,D,A, plan, alive, survivors, t, dur, waveIdx, planIdx, flashes:[{slot,age}], lines:[{a,slot,aSlot,age}]}
+let phase='rotate'; // 'sieve' | 'rotate'
+
+const V={yaw:.35,pitch:20*Math.PI/180,userZoom:1.4,fit:1.0,dragging:false,vy:0,vp:0,pinch0:0,uz0:1,midX:0,midY:0,lastTap:0};
+const touches=new Map();
+const hasTouch=('ontouchstart' in window)||(navigator.maxTouchPoints>0);
+
+function hueOf(A){return 330-285*(A/Math.max(1,PER-1))}
+function clampUz(z){return Math.min(UZ_MAX,Math.max(UZ_MIN,z))}
+function size(){
+  const dpr=Math.min(window.devicePixelRatio||1,2.5);
+  const W=window.innerWidth||390, H=window.innerHeight||844;
+  const tw=Math.max(1,Math.round(W*dpr)), th=Math.max(1,Math.round(H*dpr));
+  if(cv.width!==tw||cv.height!==th){cv.width=tw;cv.height=th}
+  return{dpr,W,H};
+}
+function applyRotate(dx,dy){V.yaw+=dx*.009;V.pitch=Math.max(-1.55,Math.min(1.55,V.pitch+dy*.009));V.vy=dx*.009;V.vp=dy*.009}
+function resetView(){V.userZoom=1.4;V.yaw=.35;V.pitch=20*Math.PI/180;V.vy=0;V.vp=0}
+function markPole(T,D){const k=T+','+D;if(poleSeen.has(k))return;poleSeen.add(k);polesVisited.push({T,D})}
+function clearOverlap(){cellCounts.fill(0);nonzero.length=0;nonzeroSet.clear();maxCount=1}
+
+function sieveDuration(g){
+  // Slow for first pole / early rings so James can watch; fast later or at high speed
+  const base=(g<PER)?SIEVE_MS_SLOW:SIEVE_MS_FAST;
+  return Math.max(40, base/speed);
+}
+
+function startSieve(g, T, D, A){
+  const built=buildSieve(g);
+  sieve={
+    g,T,D,A,
+    alive:built.alive,
+    survivors:built.survivors,
+    plan:built.plan,
+    planIdx:0,
+    t:0,
+    dur:sieveDuration(g),
+    flashes:[],
+    lines:[],
+    mrCheck:built.mrCheck
+  };
+  phase='sieve';
+}
+
+function commitSieve(){
+  if(!sieve)return;
+  const {g,T,D,A,survivors}=sieve;
+  // feed overlap
+  for(let i=0;i<survivors.length;i++){
+    const pt=pointOnRing(T,D,A,survivors[i]);
+    const id=cellIndex(pt[0],pt[1],pt[2]);
+    bumpCell(id);
+    if(cellCounts[id]>maxCount)maxCount=cellCounts[id];
+  }
+  rings.push({g,T,D,A,th:new Float32Array(survivors)});
+  while(rings.length>MAX_KEEP) rings.shift();
+  markPole(T,D);
+  gNext=g+1;
+  sieve=null;
+  phase='rotate';
+}
+
+function wipeRestart(){
+  try{localStorage.removeItem(STORE_KEY)}catch(_){}
+  rings.length=0; polesVisited.length=0; poleSeen.clear(); clearOverlap();
+  gNext=0; poleIdx=0; Afloat=0; lastDropped=-1;
+  sieve=null; phase='rotate'; play=true; resetView();
+  markPole(0,0);
+}
+
+function saveState(){
+  try{
+    const pairs=[];
+    for(let i=0;i<nonzero.length;i++){const id=nonzero[i],c=cellCounts[id];if(c)pairs.push(id,c)}
+    localStorage.setItem(STORE_KEY, JSON.stringify({v:1,g:gNext,poleIdx,Afloat,lastDropped,maxCount,pairs,phase,marker:MARKER}));
+    lastSave=performance.now();
+  }catch(_){}
+}
+function loadState(){
+  try{
+    const o=JSON.parse(localStorage.getItem(STORE_KEY)||'null');
+    if(!o||o.v!==1)return false;
+    clearOverlap();
+    const pairs=o.pairs||[];
+    for(let i=0;i<pairs.length;i+=2){
+      const id=pairs[i]|0,c=pairs[i+1]|0;
+      if(id>=0&&id<NCELL&&c>0){cellCounts[id]=c;nonzero.push(id);if(c>maxCount)maxCount=c}
+    }
+    gNext=o.g|0; poleIdx=((o.poleIdx|0)%N_POLES+N_POLES)%N_POLES;
+    Afloat=+o.Afloat||0; lastDropped=o.lastDropped|0;
+    if(o.maxCount)maxCount=o.maxCount;
+    // rebuild short trail without re-sieving (primes only from bands)
+    rings.length=0;
+    const start=Math.max(0,gNext-MAX_KEEP);
+    for(let g=start;g<gNext;g++){
+      const {T,D,A}=poleOfG(g);
+      const th=[];
+      const lo=360*g,hi=lo+360;
+      for(let n=lo;n<hi;n++){
+        if(n===1&&g===0){th.push(1*Math.PI/180);continue}
+        if(n<=5)continue;
+        if(isP(n)) th.push((n%360)*Math.PI/180);
+      }
+      rings.push({g,T,D,A,th:new Float32Array(th)});
+    }
+    markPole(POLES[poleIdx].T,POLES[poleIdx].D);
+    phase='rotate'; sieve=null;
+    return true;
+  }catch(_){return false}
+}
+
+function jumpToPole(P){
+  P=Math.max(0,Math.min(N_POLES-1,P|0));
+  rings.length=0; polesVisited.length=0; poleSeen.clear(); clearOverlap();
+  const endG=(P+1)*PER-1;
+  const trailStart=Math.max(0,endG-(MAX_KEEP-1));
+  for(let g=0;g<=endG;g++){
+    const {pi,A,T,D}=poleOfG(g);
+    const th=[];
+    const lo=360*g,hi=lo+360;
+    for(let n=lo;n<hi;n++){
+      if(n===1&&g===0){th.push(1*Math.PI/180);continue}
+      if(n<=5)continue;
+      if(isP(BigInt(n))) th.push((n%360)*Math.PI/180);
+    }
+    for(let i=0;i<th.length;i++){
+      const pt=pointOnRing(T,D,A,th[i]);
+      const id=cellIndex(pt[0],pt[1],pt[2]);
+      bumpCell(id); if(cellCounts[id]>maxCount)maxCount=cellCounts[id];
+    }
+    if(g>=trailStart) rings.push({g,T,D,A,th:new Float32Array(th)});
+    if(g%PER===0) markPole(T,D);
+  }
+  gNext=endG+1; poleIdx=P; Afloat=PER; lastDropped=PER-1;
+  phase='rotate'; sieve=null; play=false; saveState();
+}
+
+/* Assert survivors match MR for first 2000 rings */
+function assertSurvivors(limit){
+  limit=limit||2000;
+  let bad=0;
+  for(let g=0;g<limit;g++){
+    const built=buildSieve(g);
+    const got=built.survivors.map(t=>((Math.round(t*180/Math.PI)%360)+360)%360).sort((a,b)=>a-b);
+    const exp=[];
+    const lo=360*g,hi=lo+360;
+    for(let n=lo;n<hi;n++){
+      if(n===1&&g===0){exp.push(1);continue}
+      if(n<=5)continue;
+      if(isP(BigInt(n))) exp.push(n%360);
+    }
+    exp.sort((a,b)=>a-b);
+    if(got.length!==exp.length || got.some((v,i)=>v!==exp[i])){
+      bad++; if(bad<=3) console.warn('mismatch g',g,'got',got.slice(0,8),'exp',exp.slice(0,8));
+    }
+  }
+  return {limit,bad,ok:bad===0};
+}
+
+function frame(now){
+  requestAnimationFrame(frame);
+  const{dpr,W,H}=size();
+  const dt=last?Math.min(64,now-last):16; last=now;
+
+  if(play){
+    if(phase==='sieve' && sieve){
+      sieve.t+=dt;
+      const prog=Math.min(1, sieve.t/sieve.dur);
+      const target=Math.floor(prog*sieve.plan.length);
+      while(sieve.planIdx<target && sieve.planIdx<sieve.plan.length){
+        const hit=sieve.plan[sieve.planIdx++];
+        sieve.alive[hit.slot]=0;
+        sieve.flashes.push({slot:hit.slot, age:0});
+        sieve.lines.push({a:hit.a, slot:hit.slot, aSlot:hit.aSlot, age:0});
+      }
+      // age flashes/lines
+      for(const f of sieve.flashes) f.age+=dt;
+      for(const L of sieve.lines) L.age+=dt;
+      sieve.flashes=sieve.flashes.filter(f=>f.age<500);
+      sieve.lines=sieve.lines.filter(L=>L.age<700);
+      if(prog>=1){
+        // ensure all plan applied
+        while(sieve.planIdx<sieve.plan.length){
+          const hit=sieve.plan[sieve.planIdx++];
+          sieve.alive[hit.slot]=0;
+        }
+        commitSieve();
+      }
+    } else if(phase==='rotate'){
+      const dA=(dt*speed)/DEG_MS;
+      Afloat+=dA;
+      while(Afloat>=PER && phase==='rotate'){
+        // finish remaining drops for this pole via sieve
+        if(lastDropped<PER-1){
+          // start sieve for next integer instead of batching all
+          break;
+        }
+        Afloat-=PER; lastDropped=-1;
+        poleIdx=(poleIdx+1)%N_POLES;
+        markPole(POLES[poleIdx].T,POLES[poleIdx].D);
+      }
+      if(phase==='rotate'){
+        const whole=Math.floor(Afloat);
+        if(lastDropped<whole && whole<PER){
+          lastDropped++;
+          const g=gNext;
+          const p=POLES[poleIdx];
+          startSieve(g, p.T, p.D, lastDropped);
+        } else if(Afloat>=PER && lastDropped>=PER-1){
+          Afloat-=PER; lastDropped=-1;
+          poleIdx=(poleIdx+1)%N_POLES;
+          markPole(POLES[poleIdx].T,POLES[poleIdx].D);
+        }
+      }
+    }
+  }
+
+  if(!V.dragging){
+    if(Math.abs(V.vy)+Math.abs(V.vp)>.00002){
+      V.yaw+=V.vy; V.pitch=Math.max(-1.55,Math.min(1.55,V.pitch+V.vp));
+      const damp=Math.pow(.92,dt/16); V.vy*=damp; V.vp*=damp;
+    }else if(camSpin) V.yaw+=.00025*dt;
+  }
+  if(now-lastSave>10000) saveState();
+
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle='#05080f'; ctx.fillRect(0,0,W,H);
+  const cy=Math.cos(V.yaw),sy=Math.sin(V.yaw),cp=Math.cos(V.pitch),sp=Math.sin(V.pitch);
+  const sc=.54*Math.min(W,H)*V.userZoom/V.fit;
+  const Dcam=Math.max(2.0, 3.6/Math.max(1,V.userZoom*.5));
+  const near=-Dcam*.92;
+  function pr(x,y,z){
+    const x1=x*cy+z*sy, z1=-x*sy+z*cy;
+    const y2=y*cp-z1*sp, z2=y*sp+z1*cp;
+    if(z2<=near)return null;
+    const f=Dcam/(Dcam+z2);
+    return[W/2+x1*sc*f, H/2-y2*sc*f, z2, f];
+  }
+
+  // axes
+  const pn=pr(0,1.1,0), ps=pr(0,-1.1,0);
+  if(pn&&ps){ctx.strokeStyle='rgba(255,190,220,.22)';ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(pn[0],pn[1]);ctx.lineTo(ps[0],ps[1]);ctx.stroke()}
+  const curP=POLES[poleIdx];
+  const ax=poleAxis(curP.T,curP.D);
+  const t1=pr(ax[0]*1.12,ax[1]*1.12,ax[2]*1.12), t2=pr(-ax[0]*1.12,-ax[1]*1.12,-ax[2]*1.12);
+  if(t1&&t2){ctx.strokeStyle='rgba(100,220,255,.55)';ctx.lineWidth=1.6;ctx.beginPath();ctx.moveTo(t1[0],t1[1]);ctx.lineTo(t2[0],t2[1]);ctx.stroke()}
+  const pc=pr(0,0,0);
+  if(pc){
+    const g=ctx.createRadialGradient(pc[0],pc[1],0,pc[0],pc[1],20*pc[3]);
+    g.addColorStop(0,'rgba(255,120,200,.5)'); g.addColorStop(1,'rgba(255,80,160,0)');
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(pc[0],pc[1],20*pc[3],0,6.2832);ctx.fill();
+  }
+
+  ctx.globalCompositeOperation='lighter';
+
+  // overlap map
+  const logMax=Math.log(1+maxCount);
+  const stepM=nonzero.length>12000?Math.ceil(nonzero.length/12000):1;
+  for(let ii=0;ii<nonzero.length;ii+=stepM){
+    const id=nonzero[ii], c=cellCounts[id]; if(!c)continue;
+    const p=pr(cellXYZ[id*3],cellXYZ[id*3+1],cellXYZ[id*3+2]); if(!p)continue;
+    const t=Math.log(1+c)/logMax, hue=330-285*t;
+    ctx.fillStyle='hsla('+hue+',90%,65%,'+(.12+.55*t).toFixed(3)+')';
+    ctx.beginPath();ctx.arc(p[0],p[1],Math.max(0.7,(1+2.2*t)*p[3]),0,6.2832);ctx.fill();
+  }
+
+  // pole trace
+  const stepP=polesVisited.length>2500?Math.ceil(polesVisited.length/2500):1;
+  for(let i=0;i<polesVisited.length;i+=stepP){
+    const a=poleAxis(polesVisited[i].T,polesVisited[i].D);
+    const p=pr(a[0],a[1],a[2]); if(!p)continue;
+    ctx.fillStyle='rgba(180,240,255,.3)';
+    ctx.beginPath();ctx.arc(p[0],p[1],Math.max(0.7,1.1*p[3]),0,6.2832);ctx.fill();
+  }
+
+  // trail rings (primes)
+  for(let i=0;i<rings.length;i++){
+    const r=rings[i], age=rings.length-1-i;
+    const bright=Math.max(.05,.5*Math.pow(.975,age));
+    const hue=hueOf(r.A);
+    const step=age>50?2:1;
+    for(let j=0;j<r.th.length;j+=step){
+      const pt=pointOnRing(r.T,r.D,r.A,r.th[j]);
+      const p=pr(pt[0],pt[1],pt[2]); if(!p)continue;
+      ctx.fillStyle='hsla('+hue+',90%,72%,'+(.1+.5*bright).toFixed(3)+')';
+      ctx.beginPath();ctx.arc(p[0],p[1],Math.max(.45,1.1*p[3]),0,6.2832);ctx.fill();
+    }
+  }
+
+  // LIVE / SIEVE ring
+  if(phase==='sieve' && sieve){
+    const {T,D,A,alive}=sieve;
+    // ring outline
+    ctx.strokeStyle='hsla(300,80%,70%,.5)'; ctx.lineWidth=1.5; ctx.beginPath();
+    let first=null;
+    for(let s=0;s<=96;s++){
+      const th=s/96*Math.PI*2;
+      const pt=pointOnRing(T,D,A,th);
+      const p=pr(pt[0],pt[1],pt[2]); if(!p)continue;
+      if(!first){ctx.moveTo(p[0],p[1]);first=p} else ctx.lineTo(p[0],p[1]);
+    }
+    if(first){ctx.lineTo(first[0],first[1]);ctx.stroke()}
+
+    // all alive slots
+    for(let slot=0;slot<360;slot++){
+      if(!alive[slot])continue;
+      const pt=pointOnRing(T,D,A,slot*Math.PI/180);
+      const p=pr(pt[0],pt[1],pt[2]); if(!p)continue;
+      ctx.fillStyle='hsla(300,90%,75%,.85)';
+      ctx.beginPath();ctx.arc(p[0],p[1],Math.max(0.9,1.5*p[3]),0,6.2832);ctx.fill();
+    }
+    // factor lines (newest first, cap)
+    const lines=sieve.lines;
+    const start=Math.max(0, lines.length-MAX_LINES_FRAME);
+    for(let i=start;i<lines.length;i++){
+      const L=lines[i];
+      const fade=1-Math.min(1,L.age/700);
+      const pa=pointOnRing(T,D,A,L.aSlot*Math.PI/180);
+      const pb=pointOnRing(T,D,A,L.slot*Math.PI/180);
+      const qa=pr(pa[0],pa[1],pa[2]), qb=pr(pb[0],pb[1],pb[2]);
+      if(!qa||!qb)continue;
+      const hue=factorHue(L.a);
+      ctx.strokeStyle='hsla('+hue+',95%,60%,'+(0.75*fade).toFixed(3)+')';
+      ctx.lineWidth=1.2+1.2*fade;
+      ctx.beginPath();ctx.moveTo(qa[0],qa[1]);ctx.lineTo(qb[0],qb[1]);ctx.stroke();
+    }
+    // flashes on struck composites
+    for(const f of sieve.flashes){
+      const fade=1-Math.min(1,f.age/500);
+      const pt=pointOnRing(T,D,A,f.slot*Math.PI/180);
+      const p=pr(pt[0],pt[1],pt[2]); if(!p)continue;
+      ctx.fillStyle='hsla(50,100%,70%,'+(0.9*fade).toFixed(3)+')';
+      ctx.beginPath();ctx.arc(p[0],p[1],Math.max(2,3.5*p[3]*fade),0,6.2832);ctx.fill();
+    }
+  } else {
+    // live rotating ring outline at Afloat (awaiting next sieve)
+    const liveA=Afloat%PER;
+    const hue=hueOf(liveA);
+    ctx.strokeStyle='hsla('+hue+',95%,70%,.55)'; ctx.lineWidth=1.6; ctx.beginPath();
+    let first=null;
+    for(let s=0;s<=96;s++){
+      const th=s/96*Math.PI*2;
+      const pt=pointOnRing(curP.T,curP.D,liveA,th);
+      const p=pr(pt[0],pt[1],pt[2]); if(!p)continue;
+      if(!first){ctx.moveTo(p[0],p[1]);first=p} else ctx.lineTo(p[0],p[1]);
+    }
+    if(first){ctx.lineTo(first[0],first[1]);ctx.stroke()}
+  }
+
+  ctx.globalCompositeOperation='source-over';
+}
+
+/* ---- input (touchctl) ---- */
+function touchList(e){const a=[];for(let i=0;i<e.touches.length;i++){const t=e.touches[i];a.push({id:t.identifier,x:t.clientX,y:t.clientY})}return a}
+function syncTouches(list){touches.clear();for(const t of list)touches.set(t.id,{x:t.x,y:t.y})}
+function pinchDist(list){if(list.length<2)return 0;return Math.hypot(list[0].x-list[1].x,list[0].y-list[1].y)}
+function midpoint(list){if(list.length<2)return{x:list[0].x,y:list[0].y};return{x:(list[0].x+list[1].x)/2,y:(list[0].y+list[1].y)/2}}
+function onTouchStart(e){
+  e.preventDefault(); const list=touchList(e);
+  if(list.length===1&&e.changedTouches.length===1){const now=performance.now();if(now-V.lastTap<280){resetView();V.lastTap=0}else V.lastTap=now}
+  V.dragging=true;V.vy=0;V.vp=0;syncTouches(list);
+  if(list.length>=2){V.pinch0=pinchDist(list);V.uz0=V.userZoom;const m=midpoint(list);V.midX=m.x;V.midY=m.y}
+  else if(list.length===1){V.midX=list[0].x;V.midY=list[0].y}
+}
+function onTouchMove(e){
+  e.preventDefault(); const list=touchList(e); if(!list.length)return;
+  if(list.length>=2){const d=pinchDist(list);if(V.pinch0>0)V.userZoom=clampUz(V.uz0*(d/V.pinch0));const m=midpoint(list);applyRotate(m.x-V.midX,m.y-V.midY);V.midX=m.x;V.midY=m.y}
+  else{const t=list[0];applyRotate(t.x-V.midX,t.y-V.midY);V.midX=t.x;V.midY=t.y}
+  syncTouches(list);
+}
+function onTouchEnd(e){
+  e.preventDefault(); const list=touchList(e); syncTouches(list);
+  if(list.length>=2){V.pinch0=pinchDist(list);V.uz0=V.userZoom;const m=midpoint(list);V.midX=m.x;V.midY=m.y}
+  else if(list.length===1){V.midX=list[0].x;V.midY=list[0].y;V.pinch0=0}
+  else{V.dragging=false;V.pinch0=0}
+}
+function onPointerDown(e){
+  if(e.pointerType==='touch')return; if(e.button!==0)return; e.preventDefault();
+  try{cv.setPointerCapture(e.pointerId)}catch(_){}
+  V.dragging=true;V.vy=0;V.vp=0;V.midX=e.clientX;V.midY=e.clientY;
+  const now=performance.now(); if(now-V.lastTap<280){resetView();V.lastTap=0}else V.lastTap=now;
+}
+function onPointerMove(e){if(e.pointerType==='touch'||!V.dragging)return;applyRotate(e.clientX-V.midX,e.clientY-V.midY);V.midX=e.clientX;V.midY=e.clientY}
+function onPointerUp(e){if(e.pointerType==='touch')return;V.dragging=false}
+
+['gesturestart','gesturechange','gestureend'].forEach(t=>{document.addEventListener(t,e=>e.preventDefault(),{passive:false})});
+document.addEventListener('touchmove',e=>{if(e.target===cv||e.target===document.body||e.target===document.documentElement)e.preventDefault()},{passive:false});
+if(hasTouch){
+  cv.addEventListener('touchstart',onTouchStart,{passive:false});
+  cv.addEventListener('touchmove',onTouchMove,{passive:false});
+  cv.addEventListener('touchend',onTouchEnd,{passive:false});
+  cv.addEventListener('touchcancel',onTouchEnd,{passive:false});
+}else{
+  cv.addEventListener('pointerdown',onPointerDown);
+  cv.addEventListener('pointermove',onPointerMove);
+  cv.addEventListener('pointerup',onPointerUp);
+  cv.addEventListener('pointercancel',onPointerUp);
+}
+cv.addEventListener('wheel',e=>{e.preventDefault();V.userZoom=clampUz(V.userZoom*Math.exp(-e.deltaY*.0015))},{passive:false});
+window.addEventListener('resize',()=>size());
+window.addEventListener('pagehide',()=>saveState());
+document.addEventListener('visibilitychange',()=>{if(document.hidden)saveState()});
+
+document.getElementById('zm').onclick=function(){V.userZoom=clampUz(V.userZoom/1.35)};
+document.getElementById('zp').onclick=function(){V.userZoom=clampUz(V.userZoom*1.35)};
+document.getElementById('pp').onclick=function(){play=!play;this.textContent=play?'❚❚':'▶'};
+document.getElementById('sp').onclick=function(){
+  speed=speed===1?4:speed===4?16:speed===16?64:1;
+  this.textContent=speed+'×';
+};
+(function(){
+  const btn=document.getElementById('rv');
+  let tmr=0, pressed=false;
+  function start(){pressed=true;tmr=setTimeout(()=>{if(pressed){wipeRestart();pressed=false}},650)}
+  function end(){if(!pressed)return;pressed=false;clearTimeout(tmr);resetView()}
+  btn.addEventListener('pointerdown',e=>{e.preventDefault();start()});
+  btn.addEventListener('pointerup',end);
+  btn.addEventListener('pointerleave',()=>{pressed=false;clearTimeout(tmr)});
+  btn.addEventListener('touchstart',e=>{e.preventDefault();start()},{passive:false});
+  btn.addEventListener('touchend',e=>{e.preventDefault();end()},{passive:false});
+})();
+document.getElementById('rs').onclick=function(){camSpin=!camSpin;this.classList.toggle('on',camSpin)};
+
+window.__sphereMarker=MARKER; window.__assertSurvivors=assertSurvivors;
+window.__phase=()=>phase; window.__sieve=()=>sieve; window.__gNext=()=>gNext;
+window.__forcePlay=v=>{play=!!v}; window.__jumpToPole=jumpToPole;
+window.__startSieveAt=function(g){const {T,D,A}=poleOfG(g); startSieve(g,T,D,A); play=false};
+window.__setSieveProg=function(p){if(!sieve)return; sieve.t=sieve.dur*p; /* apply in next frame via play */ play=true};
+
+const params=new URLSearchParams(location.search);
+if(params.get('wipe')!==null){try{localStorage.removeItem(STORE_KEY)}catch(_){}}
+const jumpParam=params.get('jump');
+if(jumpParam!==null && jumpParam!==''){
+  jumpToPole(+jumpParam);
+  document.getElementById('pp').textContent='▶';
+}else if(!loadState()){
+  markPole(0,0);
+}
+
+size();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
