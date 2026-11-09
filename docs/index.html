@@ -8,7 +8,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#05080f">
 <title>Prime Factor Rings</title>
-<!-- prime-factor-rings-v1 -->
+<!-- prime-factor-rings-v2 -->
 <style>
 html,body{margin:0;width:100%;height:100%;height:100dvh;background:#05080f;overflow:hidden;position:fixed;inset:0;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
 canvas{display:block;width:100%;height:100%;touch-action:none;overscroll-behavior:none;outline:none}
@@ -31,8 +31,8 @@ canvas{display:block;width:100%;height:100%;touch-action:none;overscroll-behavio
 <script>
 (function(){
 'use strict';
-const MARKER='prime-factor-rings-v1';
-const STORE_KEY='pfr_v1_state';
+const MARKER='prime-factor-rings-v2';
+const STORE_KEY='pfr_v2_state';
 const cv=document.getElementById('c'),ctx=cv.getContext('2d',{alpha:false});
 
 /* ---- Miller–Rabin (assert survivors) ---- */
@@ -265,7 +265,17 @@ function sieveDuration(g){
 }
 
 function startSieve(g, T, D, A){
-  const built=buildSieve(g);
+  let built;
+  try{ built=buildSieve(g); }
+  catch(e){
+    // Fail-open: treat as empty sieve with MR survivors only
+    const survivors=[]; const lo=360*g,hi=lo+360;
+    for(let n=lo;n<hi;n++){
+      if(n===1&&g===0){survivors.push(1*Math.PI/180);continue}
+      if(n>5&&isP(BigInt(n))) survivors.push((n%360)*Math.PI/180);
+    }
+    built={alive:new Uint8Array(360),survivors,plan:[],waves:[],mrCheck:[]};
+  }
   sieve={
     g,T,D,A,
     alive:built.alive,
@@ -311,14 +321,26 @@ function saveState(){
   try{
     const pairs=[];
     for(let i=0;i<nonzero.length;i++){const id=nonzero[i],c=cellCounts[id];if(c)pairs.push(id,c)}
-    localStorage.setItem(STORE_KEY, JSON.stringify({v:1,g:gNext,poleIdx,Afloat,lastDropped,maxCount,pairs,phase,marker:MARKER}));
+    const payload=JSON.stringify({v:2,g:gNext,poleIdx,Afloat,lastDropped,maxCount,pairs,marker:MARKER});
+    localStorage.setItem(STORE_KEY, payload);
     lastSave=performance.now();
-  }catch(_){}
+  }catch(e){
+    // QuotaExceeded or private mode — never break the sim
+    try{localStorage.removeItem(STORE_KEY)}catch(_){}
+  }
+}
+function validState(o){
+  if(!o||o.v!==2)return false;
+  if(!Number.isFinite(o.g)||o.g<0)return false;
+  if(!Number.isFinite(o.Afloat)||o.Afloat<0||o.Afloat>PER*2)return false;
+  if(!Number.isFinite(o.lastDropped)||o.lastDropped<-1||o.lastDropped>=PER)return false;
+  if(!Number.isFinite(o.poleIdx))return false;
+  return true;
 }
 function loadState(){
   try{
     const o=JSON.parse(localStorage.getItem(STORE_KEY)||'null');
-    if(!o||o.v!==1)return false;
+    if(!validState(o))return false;
     clearOverlap();
     const pairs=o.pairs||[];
     for(let i=0;i<pairs.length;i+=2){
@@ -398,58 +420,63 @@ function assertSurvivors(limit){
 
 function frame(now){
   requestAnimationFrame(frame);
+  try{
   const{dpr,W,H}=size();
   const dt=last?Math.min(64,now-last):16; last=now;
 
   if(play){
+    // --- Sieve phase: always advance on elapsed time ---
     if(phase==='sieve' && sieve){
+      if(!(sieve.dur>0) || !Number.isFinite(sieve.dur)) sieve.dur=40;
       sieve.t+=dt;
       const prog=Math.min(1, sieve.t/sieve.dur);
-      const target=Math.floor(prog*sieve.plan.length);
-      while(sieve.planIdx<target && sieve.planIdx<sieve.plan.length){
+      const plen=sieve.plan?sieve.plan.length:0;
+      const target=Math.floor(prog*plen);
+      while(sieve.planIdx<target && sieve.planIdx<plen){
         const hit=sieve.plan[sieve.planIdx++];
-        sieve.alive[hit.slot]=0;
-        sieve.flashes.push({slot:hit.slot, age:0});
-        sieve.lines.push({a:hit.a, slot:hit.slot, aSlot:hit.aSlot, age:0});
+        if(hit&&hit.slot>=0&&hit.slot<360){
+          sieve.alive[hit.slot]=0;
+          sieve.flashes.push({slot:hit.slot, age:0});
+          sieve.lines.push({a:hit.a, slot:hit.slot, aSlot:hit.aSlot, age:0});
+        }
       }
-      // age flashes/lines
       for(const f of sieve.flashes) f.age+=dt;
       for(const L of sieve.lines) L.age+=dt;
       sieve.flashes=sieve.flashes.filter(f=>f.age<500);
       sieve.lines=sieve.lines.filter(L=>L.age<700);
       if(prog>=1){
-        // ensure all plan applied
-        while(sieve.planIdx<sieve.plan.length){
+        while(sieve.planIdx<plen){
           const hit=sieve.plan[sieve.planIdx++];
-          sieve.alive[hit.slot]=0;
+          if(hit&&hit.slot>=0&&hit.slot<360) sieve.alive[hit.slot]=0;
         }
         commitSieve();
       }
     } else if(phase==='rotate'){
-      const dA=(dt*speed)/DEG_MS;
-      Afloat+=dA;
-      while(Afloat>=PER && phase==='rotate'){
-        // finish remaining drops for this pole via sieve
-        if(lastDropped<PER-1){
-          // start sieve for next integer instead of batching all
-          break;
+      // Advance angle
+      const dA=(dt*Math.max(0.25,speed))/DEG_MS;
+      if(Number.isFinite(dA)) Afloat+=dA;
+      if(!Number.isFinite(Afloat) || Afloat<0) Afloat=0;
+      // Drain due rings without deadlock when Afloat >= PER
+      // Due index: rings 0..due must be started; due = min(floor(Afloat), PER-1) while Afloat<PER,
+      // or PER-1 when Afloat>=PER (finish the pole).
+      let due = Afloat>=PER ? (PER-1) : Math.floor(Afloat);
+      if(due<0) due=0;
+      if(lastDropped < due){
+        lastDropped++;
+        // Backlog catch-up: use fast sieve so we don't stall for minutes
+        const backlog=due-lastDropped;
+        const p=POLES[poleIdx];
+        startSieve(gNext, p.T, p.D, lastDropped);
+        if(backlog>0 || Afloat>=PER || speed>=16){
+          // Instant-complete animation for catch-up / high speed
+          sieve.dur=Math.min(sieve.dur, 60);
         }
-        Afloat-=PER; lastDropped=-1;
+      } else if(Afloat>=PER && lastDropped>=PER-1){
+        Afloat-=PER;
+        if(Afloat>=PER) Afloat=Afloat%PER; // safety if hugely ahead
+        lastDropped=-1;
         poleIdx=(poleIdx+1)%N_POLES;
         markPole(POLES[poleIdx].T,POLES[poleIdx].D);
-      }
-      if(phase==='rotate'){
-        const whole=Math.floor(Afloat);
-        if(lastDropped<whole && whole<PER){
-          lastDropped++;
-          const g=gNext;
-          const p=POLES[poleIdx];
-          startSieve(g, p.T, p.D, lastDropped);
-        } else if(Afloat>=PER && lastDropped>=PER-1){
-          Afloat-=PER; lastDropped=-1;
-          poleIdx=(poleIdx+1)%N_POLES;
-          markPole(POLES[poleIdx].T,POLES[poleIdx].D);
-        }
       }
     }
   }
@@ -587,6 +614,7 @@ function frame(now){
   }
 
   ctx.globalCompositeOperation='source-over';
+  }catch(err){ try{ console.warn('pfr frame', err); }catch(_){ } }
 }
 
 /* ---- input (touchctl) ---- */
